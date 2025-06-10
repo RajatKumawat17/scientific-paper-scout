@@ -1,0 +1,7 @@
+httpx
+openai
+anthropic
+google-generativeai
+python-dotenv
+PyMuPDF
+groq

@@ -190,14 +190,38 @@ class LLMClient:
 class PaperSearchServer:
     """MCP server for searching arXiv papers"""
     
+    def _fix_arxiv_pdf_url(self, url: str) -> str:
+        """Convert arxiv.org PDF URLs to export.arxiv.org for programmatic access"""
+        if url and 'arxiv.org/pdf/' in url:
+            # Replace arxiv.org with export.arxiv.org
+            url = url.replace('arxiv.org/pdf/', 'export.arxiv.org/pdf/')
+            # Ensure it uses https
+            if url.startswith('http://'):
+                url = url.replace('http://', 'https://')
+        return url
+    
+    def _extract_arxiv_id_and_create_pdf_url(self, arxiv_id: str) -> str:
+        """Create PDF URL from arXiv ID"""
+        # Clean the arXiv ID (remove version if present)
+        if 'v' in arxiv_id:
+            arxiv_id = arxiv_id.split('v')[0]
+        
+        # Create PDF URL using export.arxiv.org
+        return f"https://export.arxiv.org/pdf/{arxiv_id}.pdf"
+    
     async def search_papers(self, query: str, max_results: int = 5) -> Dict:
         """Search arXiv for papers matching the query"""
         try:
             encoded_query = quote(query)
+            # Use export.arxiv.org for API requests as recommended
             url = f"http://export.arxiv.org/api/query?search_query=all:{encoded_query}&start=0&max_results={max_results}&sortBy=submittedDate&sortOrder=descending"
             
+            headers = {
+                'User-Agent': 'Paper-Scout/1.0 (scientific research tool)'
+            }
+            
             async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=30.0)
+                response = await client.get(url, timeout=30.0, headers=headers)
                 response.raise_for_status()
                 
                 # Parse XML response
@@ -210,13 +234,25 @@ class PaperSearchServer:
                     summary_elem = entry.find('atom:summary', namespace)
                     authors = entry.findall('atom:author', namespace)
                     published_elem = entry.find('atom:published', namespace)
-                    pdf_link = None
+                    id_elem = entry.find('atom:id', namespace)
                     
-                    # Find PDF link
-                    for link in entry.findall('atom:link', namespace):
-                        if link.get('title') == 'pdf':
-                            pdf_link = link.get('href')
-                            break
+                    # Extract arXiv ID from the entry ID
+                    arxiv_id = None
+                    pdf_url = None
+                    
+                    if id_elem is not None:
+                        # Extract arXiv ID from URL like http://arxiv.org/abs/2301.00001v1
+                        id_text = id_elem.text
+                        if '/abs/' in id_text:
+                            arxiv_id = id_text.split('/abs/')[-1]
+                            pdf_url = self._extract_arxiv_id_and_create_pdf_url(arxiv_id)
+                    
+                    # Also check for explicit PDF links as backup
+                    if not pdf_url:
+                        for link in entry.findall('atom:link', namespace):
+                            if link.get('title') == 'pdf':
+                                pdf_url = self._fix_arxiv_pdf_url(link.get('href'))
+                                break
                     
                     author_names = []
                     for author in authors:
@@ -224,13 +260,20 @@ class PaperSearchServer:
                         if name_elem is not None:
                             author_names.append(name_elem.text)
                     
-                    papers.append({
+                    paper_data = {
                         'title': title_elem.text.strip() if title_elem is not None else "Unknown Title",
                         'summary': summary_elem.text.strip() if summary_elem is not None else "No summary available",
                         'authors': author_names,
                         'published': published_elem.text if published_elem is not None else "Unknown date",
-                        'pdf_url': pdf_link
-                    })
+                        'pdf_url': pdf_url,
+                        'arxiv_id': arxiv_id
+                    }
+                    
+                    papers.append(paper_data)
+                
+                logger.info(f"Found {len(papers)} papers for query: {query}")
+                for i, paper in enumerate(papers):
+                    logger.info(f"Paper {i+1}: {paper['title'][:50]}... | PDF: {paper['pdf_url']}")
                 
                 return {
                     'papers': papers,
@@ -251,15 +294,51 @@ class PDFSummarizeServer:
     async def summarize_pdf(self, pdf_url: str) -> Dict:
         """Download PDF and generate summary"""
         try:
-            # Download PDF
+            headers = {
+                'User-Agent': 'Paper-Scout/1.0 (scientific research tool)',
+                'Accept': 'application/pdf'
+            }
+            
+            logger.info(f"Attempting to download PDF from: {pdf_url}")
+            
+            # Download PDF with retry logic
             async with httpx.AsyncClient() as client:
-                response = await client.get(pdf_url, timeout=60.0)
-                response.raise_for_status()
+                for attempt in range(3):
+                    try:
+                        response = await client.get(pdf_url, timeout=60.0, headers=headers, follow_redirects=True)
+                        response.raise_for_status()
+                        break
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code == 404:
+                            # Try alternative URL formats
+                            if 'export.arxiv.org' in pdf_url:
+                                alt_url = pdf_url.replace('export.arxiv.org', 'arxiv.org')
+                                logger.info(f"Trying alternative URL: {alt_url}")
+                                try:
+                                    response = await client.get(alt_url, timeout=60.0, headers=headers, follow_redirects=True)
+                                    response.raise_for_status()
+                                    break
+                                except:
+                                    pass
+                        
+                        if attempt == 2:  # Last attempt
+                            raise
+                        
+                        await asyncio.sleep(1)  # Wait before retry
+                
+                # Verify we got a PDF
+                content_type = response.headers.get('content-type', '')
+                if 'pdf' not in content_type.lower() and len(response.content) < 1000:
+                    logger.error(f"Invalid PDF content. Content-Type: {content_type}, Size: {len(response.content)}")
+                    return {'error': 'Invalid PDF content received'}
+                
+                logger.info(f"Successfully downloaded PDF, size: {len(response.content)} bytes")
                 
                 # Extract text from PDF
                 doc = fitz.open(stream=response.content, filetype="pdf")
                 text = ""
-                for page in doc:
+                for page_num in range(min(10, doc.page_count)):  # Limit to first 10 pages
+                    page = doc[page_num]
                     text += page.get_text()
                 doc.close()
                 
@@ -269,6 +348,8 @@ class PDFSummarizeServer:
                 # Truncate text if too long (keep first 4000 chars)
                 if len(text) > 4000:
                     text = text[:4000] + "..."
+                
+                logger.info(f"Extracted {len(text)} characters from PDF")
                 
                 # Generate summary
                 messages = [
@@ -304,6 +385,10 @@ class PDFSummarizeServer:
                         'url': url,
                         'summary': result['summary']
                     })
+                
+                # Add small delay between requests to be respectful
+                if i < len(pdf_urls):
+                    await asyncio.sleep(1)
             
             if not individual_summaries:
                 return {'error': 'Failed to summarize any of the provided PDFs'}
